@@ -1,3 +1,4 @@
+// 描述了一个文档数据源（Document Source） 的抽象。它通常用于协作编辑（如 Yjs/Automerge 这类 CRDT 库）或分布式同步场景，定义了本地与远端（或存储层）之间同步文档数据的约定。
 export interface DocSource {
   /**
    * for debug

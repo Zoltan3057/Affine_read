@@ -49,6 +49,9 @@ export interface DocPeerStatus {
  *
  * listen: listen for updates from ydoc, typically from user modifications.
  * subscribe: listen for updates from storage, typically from other users.
+ * SyncPeer 的职责是管理同步的流程和状态：什么时候拉取、什么时候推送、如何处理子文档、断线了怎么重试等等。
+ * 属于 BlockSuite 框架的数据同步层。
+ * 负责把一个 Yjs 文档（Y.Doc，含其子文档 subdocs）与一个外部数据源（DocSource，如服务器、IndexedDB）进行双向同步。
  *
  */
 export class SyncPeer {
@@ -63,6 +66,7 @@ export class SyncPeer {
   readonly abort = new AbortController();
 
   // handle updates from storage
+  // 接收其他用户/存储的更新，应用到本地 Y.Doc
   handleStorageUpdates = (id: string, data: Uint8Array) => {
     this.state.pullUpdatesQueue.push({
       id,
@@ -91,6 +95,7 @@ export class SyncPeer {
   };
 
   // handle updates from ydoc
+  // 监听本地修改，合并后推送到数据源
   handleYDocUpdates = (update: Uint8Array, origin: string, doc: Doc) => {
     // don't push updates from storage
     if (origin === this.name) {
@@ -152,6 +157,8 @@ export class SyncPeer {
 
   constructor(
     readonly rootDoc: Doc,
+    readonly source: DocSource, // SyncPeer 内部持有一个 source: DocSource 字段，然后调用这个字段的方法：
+    // storage 这个概念在 SyncPeer 这一层被抽象成了 DocSource。
     readonly source: DocSource,
     readonly priorityTarget = new SharedPriorityTarget(),
     readonly logger: Logger
@@ -170,10 +177,12 @@ export class SyncPeer {
     throwIfAborted(abort);
 
     if (docData && docData.length > 0) {
+      applyUpdate(doc, docData, 'load'); // 拉取远端有、本地没有的
       applyUpdate(doc, docData, 'load');
     }
 
     // diff root doc and in-storage, save updates to pendingUpdates
+    // 推送本地有、远端没有的
     this.state.pushUpdatesQueue.push({
       id: doc.guid,
       data: [encodeStateAsUpdate(doc, inStorageState)],
@@ -217,6 +226,7 @@ export class SyncPeer {
 
   /**
    * main synchronization logic
+   * sync() 方法里用 Promise.all 同时跑三个 while 循环：
    */
   async sync(abortOuter: AbortSignal) {
     this.initState();
@@ -244,6 +254,7 @@ export class SyncPeer {
       await this.connectDoc(this.rootDoc, abortInner.signal);
 
       // Step 2: load subdocs
+      // 启动时把 rootDoc.getSubdocs() 全部加入 subdocsLoadQueue 逐个加载。
       this.state.subdocsLoadQueue.push(
         ...Array.from(this.rootDoc.getSubdocs()).map(doc => ({
           id: doc.guid,
@@ -256,6 +267,7 @@ export class SyncPeer {
 
       // Finally: start sync
       await Promise.all([
+        // load subdocs 子文档加载循环
         // load subdocs
         (async () => {
           while (throwIfAborted(abortInner.signal)) {
@@ -269,6 +281,8 @@ export class SyncPeer {
             this.updateSyncStatus();
           }
         })(),
+        // push updates 推送循环
+        // pull updates 拉取循环
         // pull updates
         (async () => {
           while (throwIfAborted(abortInner.signal)) {

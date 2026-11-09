@@ -18,6 +18,8 @@ export interface BlockInfo {
   parentBlockId?: string;
   additional?: string;
 }
+// 负责数据的最终存放。它不关心同步逻辑，只负责读和写。
+// DocStorage = 本地持久化（真正离线可用的那层）
 
 export interface CrawlResult {
   blocks: BlockInfo[];

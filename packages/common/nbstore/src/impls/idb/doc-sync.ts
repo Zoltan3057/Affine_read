@@ -5,6 +5,7 @@ import {
   DocSyncStorageBase,
 } from '../../storage';
 import { IDBConnection, type IDBConnectionOptions } from './db';
+// 一个特殊的“账本”仓库，记录每个 peer 同步到了什么进度（时钟/clock），用来实现断点续传
 
 export class IndexedDBDocSyncStorage extends DocSyncStorageBase {
   static readonly identifier = 'IndexedDBDocSyncStorage';

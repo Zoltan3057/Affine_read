@@ -49,6 +49,7 @@ interface Status {
   skipped: boolean;
   errorMessage: string | null;
 }
+// framework 版一个 peer 只对一个 DocSource；nbstore 版一个 peer 同时持有 local 和 remote 两个 DocStorage，并多了 syncMetadata 做断点续传。
 
 interface PeerState {
   total: number;

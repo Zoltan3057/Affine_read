@@ -86,6 +86,7 @@ const logger = new DebugLogger('livedata');
  * @see {@link https://developer.android.com/topic/libraries/architecture/livedata}
  */
 export class LiveData<T = unknown>
+  // LiveData 直接继承 RxJS 的 Observable，所以它本身就是一个可订阅的数据流，能用 .pipe() 和所有 RxJS 操作符。这也是它能实现 InteropObservable 接口的原因。
   extends Observable<T>
   implements InteropObservable<T>
 {
@@ -236,7 +237,9 @@ export class LiveData<T = unknown>
     );
   }
 
+  // 内部用 BehaviorSubject 存值.BehaviorSubject 是 RxJS 里"带当前值、订阅时立即回放最新值"的 Subject。这正好对应 LiveData 的语义：subscribe 时会立刻拿到当前值，而不是等下一次变化。value / getValue() 读的就是 raw$.value。
   private readonly raw$: BehaviorSubject<T>;
+  // ops$ 发出 'watch' / 'unwatch' / 'get' / 'set' 四种操作，用来实现引用计数式的懒订阅：没人订阅时不运行上游，有人 watch 才启动上游数据流。
   private readonly ops$ = new Subject<LiveDataOperation>();
   private readonly upstreamSubscription: Subscription | undefined;
 

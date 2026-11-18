@@ -35,28 +35,54 @@ import type { DefaultOpenProperty } from '../../components/properties';
 import { BlocksuiteDocEditor, BlocksuiteEdgelessEditor } from './lit-adaper';
 import * as styles from './styles.css';
 
+/**
+ * BlockSuite 编辑器自定义元素（<affine-editor-container>）暴露的对外接口。
+ * 这里用接口描述它的形状，以便上层（如 doc 模块）以统一方式访问编辑器实例。
+ */
 export interface AffineEditorContainer extends HTMLElement {
+  /** 当前文档的 BlockSuite store */
   page: Store;
+  /** 等价于 page，保留旧命名以兼容历史调用方 */
   doc: Store;
+  /** 文档标题组件实例 */
   docTitle: DocTitle;
+  /** 编辑器宿主，提供 std / view / command 等能力 */
   host?: EditorHost;
+  /** 文档根 block 模型 */
   model: RootBlockModel | null;
+  /** lit 组件的渲染完成 Promise */
   updateComplete: Promise<boolean>;
+  /** 编辑器当前模式：页面模式或白板模式 */
   mode: DocMode;
+  /** 编辑器挂载的 DOM 容器 */
   origin: HTMLDivElement;
+  /** BlockSuite 标准作用域，命令、视图等入口都在这里 */
   std: BlockStdScope;
 }
 
+/**
+ * BlockSuiteEditor 对外暴露的 props。
+ */
 export interface EditorProps extends HTMLAttributes<HTMLDivElement> {
+  /** 要渲染的文档 store */
   page: Store;
+  /** 页面 / 白板模式 */
   mode: DocMode;
+  /** 是否为分享场景（会影响部分交互行为） */
   shared?: boolean;
+  /** 只读模式 */
   readonly?: boolean;
+  /** 新建文章时默认展开的属性面板 */
   defaultOpenProperty?: DefaultOpenProperty;
-  // on Editor ready
+  // on Editor ready：编辑器渲染完成后回调，返回的函数会在销毁时被调用（用于清理副作用）
   onEditorReady?: (editor: AffineEditorContainer) => (() => void) | void;
 }
 
+/**
+ * 编辑器核心实现：根据 mode 渲染页面编辑器或白板编辑器，
+ * 并用一个 Proxy 伪装成 AffineEditorContainer，供上层以统一接口访问。
+ * 注意：该组件只在文档加载完成后才会挂载（见下方 BlockSuiteEditor）。
+ */
 const BlockSuiteEditorImpl = ({
   mode,
   page,
@@ -68,15 +94,19 @@ const BlockSuiteEditorImpl = ({
   defaultOpenProperty,
   ...props
 }: EditorProps) => {
+  // 外层容器引用，同时也是 Proxy 兜底的属性转发目标
   const rootRef = useRef<HTMLDivElement>(null);
+  // 两种模式各自持有自己的 lit 编辑器引用，只有当前模式的 ref 有值
   const docRef = useRef<PageEditor>(null);
   const docTitleRef = useRef<DocTitle>(null);
   const edgelessRef = useRef<EdgelessEditor>(null);
   const featureFlags = useService(FeatureFlagService).flags;
+  // 是否开启从右到左编辑（RTL）支持
   const enableEditorRTL = useLiveData(featureFlags.enable_editor_rtl.$);
   const editorSetting = useService(EditorSettingService).editorSetting;
   const server = useService(ServerService).server;
 
+  // 是否允许鼠标中键粘贴（Linux 下中键默认用于粘贴选中内容，需要特殊处理）
   const { enableMiddleClickPaste } = useLiveData(
     editorSetting.settings$.selector(s => ({
       enableMiddleClickPaste: s.enableMiddleClickPaste,
@@ -85,6 +115,12 @@ const BlockSuiteEditorImpl = ({
 
   /**
    * mimic an AffineEditorContainer using proxy
+   *
+   * 用一个普通对象提供 AffineEditorContainer 的核心属性，再用 Proxy 包装：
+   * - `has`：让 `'xxx' in editor` 同时命中 api 和外层容器 DOM 的属性和方法；
+   * - `get`：优先读取 api；否则从 rootRef（DOM 元素）上取，函数会自动绑定到该元素，
+   *   以兼容旧版自定义元素上暴露的方法（如 focus、scrollTo 等）。
+   * 当底层 lit 组件尚未挂载时，相关 getter 会返回 undefined / null。
    */
   const affineEditorContainerProxy = useMemo(() => {
     const api = {
@@ -149,6 +185,12 @@ const BlockSuiteEditorImpl = ({
     return proxy;
   }, [mode, page]);
 
+  /**
+   * 页面模式下点击空白区域的处理：
+   * - 只读 / 分享 / 文档只读时不响应；
+   * - 若最后一个 note 的最后一段是空段落，则把光标聚焦到它末尾，避免产生多余空行；
+   * - 否则在文档末尾追加一个新段落。
+   */
   const handleClickPageModeBlank = useCallback(() => {
     if (shared || readonly || page.readonly) return;
     const std = affineEditorContainerProxy.host?.std;
@@ -163,6 +205,7 @@ const BlockSuiteEditorImpl = ({
         lastBlock.flavour === 'affine:paragraph' &&
         lastBlock.text?.length === 0
       ) {
+        // 已有空段落，直接聚焦其末尾即可
         const focusBlock = std.view.getBlock(lastBlock.id) ?? undefined;
         std.command.exec(focusBlockEnd, {
           focusBlock,
@@ -172,9 +215,13 @@ const BlockSuiteEditorImpl = ({
       }
     }
 
+    // 没有可复用的空段落时，追加一个新段落
     std.command.exec(appendParagraphCommand);
   }, [affineEditorContainerProxy.host?.std, page, readonly, shared]);
 
+  // 处理 Linux 下的鼠标中键行为：
+  // Linux 默认用中键粘贴选中内容，在编辑器里容易误触，因此在未开启「中键粘贴」时拦截；
+  // 但点击链接 / 引用块时放行，以保留中键打开链接等原生行为。
   useEffect(() => {
     const editorContainer = rootRef.current;
     if (editorContainer) {
@@ -208,10 +255,15 @@ const BlockSuiteEditorImpl = ({
     return;
   }, [enableMiddleClickPaste]);
 
+  // 编辑器生命周期副作用：
+  // 1. 把当前编辑器实例挂到 globalThis，便于调试 / 兼容旧代码访问；
+  // 2. 向 BlockSuite 注册图片代理，用于跨域图片的加载与导出；
+  // 3. 等编辑器渲染完成后触发 onEditorReady，并收集其返回的清理函数，卸载时统一释放。
   useEffect(() => {
     const editor = affineEditorContainerProxy;
     globalThis.currentEditor = editor;
     const disposableGroup = new DisposableGroup();
+    // 组件可能在此之前就被卸载，用该标记避免触发已失效的回调
     let canceled = false;
 
     // provide image proxy endpoint to blocksuite
@@ -246,6 +298,7 @@ const BlockSuiteEditorImpl = ({
     <div
       {...props}
       data-testid={`editor-${page.id}`}
+      // 由特性开关决定是否启用 RTL 排版
       dir={enableEditorRTL ? 'rtl' : 'ltr'}
       className={clsx(
         `editor-wrapper ${mode}-mode`,
@@ -256,6 +309,7 @@ const BlockSuiteEditorImpl = ({
       data-affine-editor-container
       ref={rootRef}
     >
+      {/* 页面 / 白板模式二选一渲染，同一时刻只有一个编辑器实例存在 */}
       {mode === 'page' ? (
         <BlocksuiteDocEditor
           shared={shared}
@@ -277,9 +331,15 @@ const BlockSuiteEditorImpl = ({
   );
 };
 
+/**
+ * 编辑器入口组件：负责加载态与字体设置，等文档根 block 就绪后再挂载真正的编辑器实现。
+ */
 export const BlockSuiteEditor = (props: EditorProps) => {
+  // 文档根 block 是否已就绪；未就绪时展示骨架屏
   const [isLoading, setIsLoading] = useState(true);
+  // 加载超过一定时间后，骨架屏切换为「加载较久」的提示样式
   const [longerLoading, setLongerLoading] = useState(false);
+  // 记录加载开始时间，用于统计文档加载耗时；只在首次渲染时取值
   // oxlint-disable-next-line react-hooks-js/purity
   const [loadStartTime] = useState(Date.now());
   const workspaceService = useService(WorkspaceService);
@@ -292,6 +352,8 @@ export const BlockSuiteEditor = (props: EditorProps) => {
       fullWidthLayout: s.fullWidthLayout,
     }))
   );
+  // 计算最终生效的字体：自定义字体时拼接「自定义字体, 预设字体」，
+  // 找不到预设项则回退到主题的默认无衬线字体。
   const fontFamily = useMemo(() => {
     const fontStyle = fontStyleOptions.find(
       option => option.key === settings.fontFamily
@@ -306,6 +368,8 @@ export const BlockSuiteEditor = (props: EditorProps) => {
       : fontStyle.value;
   }, [settings.customFontFamily, settings.fontFamily]);
 
+  // 等待文档根 block 加载完成：已有 root 则直接结束加载；
+  // 否则订阅 rootAdded 事件，root 加入后取消订阅并结束加载。
   useEffect(() => {
     if (props.page.root) {
       setIsLoading(false);
@@ -322,6 +386,7 @@ export const BlockSuiteEditor = (props: EditorProps) => {
     };
   }, [loadStartTime, props.page]);
 
+  // 加载超时兜底：20s 仍未加载完成则提示「加载较久」，60s 仍未完成则上报一次加载失败埋点。
   useEffect(() => {
     const timer = setTimeout(() => {
       if (isLoading) {
@@ -344,6 +409,8 @@ export const BlockSuiteEditor = (props: EditorProps) => {
     };
   }, [isLoading, loadStartTime, props.page]);
 
+  // 无论骨架屏是否结束，都等待底层 doc engine 的加载结果，并上报成功 / 失败埋点，
+  // 用于衡量文档加载成功率与耗时。
   useEffect(() => {
     workspaceService.workspace.engine.doc
       .waitForDocLoaded(props.page.id)
@@ -366,6 +433,7 @@ export const BlockSuiteEditor = (props: EditorProps) => {
   }, [loadStartTime, props.page, workspaceService]);
 
   return (
+    // 通过 CSS 变量把字体下发给编辑器内部；页面切换时用 key 强制重建组件实例
     <Slot style={{ '--affine-font-family': fontFamily } as CSSProperties}>
       {isLoading ? (
         <EditorLoading longerLoading={longerLoading} />

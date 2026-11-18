@@ -1,3 +1,22 @@
+/**
+ * BlockSuite 的核心 Store：把一份 Y.Doc 映射成可读写的块模型树。
+ *
+ * 分层关系：
+ *   Y.Doc (spaceDoc)
+ *     └─ Y.Map('blocks')            —— Yjs 侧的块数据
+ *          └─ Store                 —— 本文件：块模型树 + 生命周期 + 事件
+ *               └─ Block / BlockModel —— 单个块的 CRUD 包装与响应式属性
+ *
+ * Store 负责：
+ * - 监听 Y.Map('blocks') 的变化，增量维护内存中的 `_blocks` 映射
+ * - 提供块的增删改查、移动、兄弟节点查询
+ * - 通过 signals（@preact/signals-core）提供响应式的 blocks / readonly / isEmpty
+ * - 通过 RxJS Subject（slots）广播 ready / blockUpdated 等事件
+ * - 维护撤销历史（Y.UndoManager，由 HistoryExtension 提供）
+ *
+ * 一个 Y.Doc 可以有多个 Store（不同 query / readonly 组合），
+ * 由 StoreContainer 按 key 缓存。
+ */
 import { Container, type ServiceProvider } from '@blocksuite/global/di';
 import { DisposableGroup } from '@blocksuite/global/disposable';
 import { BlockSuiteError, ErrorCode } from '@blocksuite/global/exceptions';
@@ -31,6 +50,17 @@ import { StoreIdentifier } from './identifier.js';
 import { type Query, runQuery } from './query.js';
 import { syncBlockProps } from './utils.js';
 
+/**
+ * 创建 Store 的参数。
+ *
+ * - `doc`：底层的 Doc（内部持有 Y.Doc），Store 从它派生数据；
+ * - `readonly`：初始只读状态，可通过 `store.readonly` 动态切换；
+ * - `query`：块过滤条件，只有命中 query 的块才会被渲染（Store 内部仍保存全部块）；
+ * - `provider`：父级 DI 容器（Doc / Workspace 层），Store 自己的容器找不到实现时回退到这里；
+ * - `extensions`：该 Store 专属的扩展（schema、命令、UI 能力等），
+ *   与内置的 StoreSelectionExtension / HistoryExtension 一起装入 Store 的容器。
+ * - `id`：仅由 StoreContainer 用作缓存 key，Store 构造时并不会读取它。
+ */
 export type StoreOptions = {
   doc: Doc;
   id?: string;
@@ -181,6 +211,7 @@ export type StoreSlots = {
   >;
 };
 
+// 每个 Store 都一定会装载的扩展：选区状态管理 + 撤销/重做历史
 const internalExtensions = [StoreSelectionExtension, HistoryExtension];
 
 /**
@@ -203,31 +234,44 @@ export class Store {
    */
   disposableGroup = new DisposableGroup();
 
+  /** Store 的 DI 提供者：自身扩展 + 父级 provider 组成查找链 */
   private readonly _provider: ServiceProvider;
 
+  /** 当前事务是否计入撤销历史；由 withoutTransact 临时置为 false */
   private _shouldTransact = true;
 
+  /** 跑一次 query，更新该 block 的 visibility（display / hidden / bypass） */
   private readonly _runQuery = (block: Block) => {
     runQuery(this._query, block);
   };
 
+  /** 底层文档，负责持有 Y.Doc、提供 id / loaded / meta 等 */
   private readonly _doc: Doc;
 
+  /**
+   * 内存中的块映射：id → Block。
+   * 用 signal 包裹，整体替换对象来触发响应式更新；不要原地修改。
+   */
   private readonly _blocks = signal<Record<string, Block>>({});
 
+  /** Y.Map('blocks') 的 CRUD 封装，所有写操作最终都落到这里 */
   private readonly _crud: DocCRUD;
 
+  /** 当前 Store 的块过滤条件；空 match + loose 表示不过滤 */
   private readonly _query: Query = {
     match: [],
     mode: 'loose',
   };
 
+  /** 只读状态；readonly 为 true 时所有写操作都会被拒绝 */
   private readonly _readonly = signal(false);
 
+  /** 响应式的空状态：root 为空，或 root block 自己判定为空 */
   private readonly _isEmpty = computed(() => {
     return this.root?.isEmpty() ?? true;
   });
 
+  /** 由所有扩展注册的 BlockSchema 汇总而成的 schema 表 */
   private readonly _schema: Schema;
 
   /**
@@ -246,6 +290,7 @@ export class Store {
    */
   readonly slots: StoreSlots;
 
+  /** 快捷访问 Yjs 侧的 Y.Map('blocks') */
   private get _yBlocks() {
     return this._doc.yBlocks;
   }
@@ -293,6 +338,7 @@ export class Store {
    * @category Block CRUD
    */
   get blockSize() {
+    // peek() 只读当前快照，不建立 signals 依赖（不会触发组件重渲染）
     return Object.values(this._blocks.peek()).length;
   }
 
@@ -366,6 +412,14 @@ export class Store {
    * });
    * ```
    *
+   * 事务的 origin 决定这次修改是否进入撤销历史：
+   * - shouldTransact = true  → origin = spaceDoc.clientID，
+   *   正好命中 HistoryExtension 的 UndoManager.trackedOrigins，可以 undo/redo
+   * - shouldTransact = false → origin = null，不会进入撤销栈
+   *
+   * 回调内的异常会被捕获并打印，不会继续向上抛——这是为了不让一次
+   * 命令失败打断整个编辑器的渲染/事件循环。
+   *
    * @category History
    */
   transact(fn: () => void, shouldTransact: boolean = this._shouldTransact) {
@@ -396,6 +450,12 @@ export class Store {
    * });
    * ```
    *
+   * 通过临时把 _shouldTransact 置为 false 实现：期间调用 transact 会使用
+   * origin = null，因此不会进入 UndoManager。
+   *
+   * 注意：fn 必须是同步的，并且这里没有 try/finally——如果 fn 抛异常，
+   * _shouldTransact 会停留在 false。需要处理异常时请自行 try/finally。
+   *
    * @category History
    */
   withoutTransact(fn: () => void) {
@@ -421,6 +481,8 @@ export class Store {
    * @category History
    */
   captureSync = () => {
+    // stopCapturing 会在撤销栈里切一刀：之后的修改属于新的 stack item，
+    // 撤销时不会和之前的修改合并成一步
     this._history.undoManager.stopCapturing();
   };
 
@@ -516,6 +578,8 @@ export class Store {
   /**
    * Get the root block of the store.
    *
+   * 根块 id 由 DocCRUD 记录；Y.Doc 尚未初始化根块（或根块已被删除）时返回 null。
+   *
    * @category Block CRUD
    */
   get root() {
@@ -548,8 +612,10 @@ export class Store {
     return this._doc.spaceDoc;
   }
 
+  /** 是否已 dispose；load 时据此决定是否需要重建事件订阅 */
   private _isDisposed = false;
 
+  /** 懒查找 HistoryExtension（每个 Store 的容器都会注册，父级 provider 作为兜底） */
   private get _history() {
     return this._provider.get(HistoryExtension);
   }
@@ -558,6 +624,15 @@ export class Store {
    * @internal
    * In most cases, you don't need to use the constructor directly.
    * The store is created by the {@link Doc} instance.
+   *
+   * 构造过程：
+   * 1. 创建事件 slots 和空的 schema 注册表
+   * 2. 建一个 Store 自己的 DI 容器：先注册内置扩展（选区、历史），再注册调用方扩展
+   * 3. 把容器挂到父 provider（Doc / Workspace 层）上，形成查找链
+   * 4. 从扩展里收集 BlockSchema 并注册
+   * 5. 通过父 provider 拿到当前 Doc（DocIdentifier），建立 CRUD 封装
+   * 6. 监听 Y.Map('blocks')，并把已存在的块补建为内存中的 Block 实例
+   * 7. 订阅 yBlockUpdated，把之后 Yjs 的块增删事件转换成内存 Block 的创建 / 销毁
    */
   constructor({ readonly, query, provider, extensions }: StoreOptions) {
     this.slots = {
@@ -569,23 +644,29 @@ export class Store {
     };
     this._schema = new Schema();
 
+    // 每个 Store 有独立的 DI 容器，便于不同 query / readonly 的 Store 拥有不同扩展
     const container = new Container();
     container.addImpl(StoreIdentifier, () => this);
 
+    // 内置扩展：选区（StoreSelectionExtension）和撤销历史（HistoryExtension）
     internalExtensions.forEach(ext => {
       ext.setup(container);
     });
 
+    // 调用方传入的扩展（各 block 的 schema、命令、UI 能力等）
     const userExtensions = extensions ?? [];
     this.userExtensions = userExtensions;
     userExtensions.forEach(extension => {
       extension.setup(container);
     });
 
+    // provider 链：先查 Store 自己的扩展，找不到再回退到父级（Doc / Workspace）
     this._provider = container.provider(undefined, provider);
+    // 所有扩展注册的 BlockSchema 汇总到 Store 的 schema 中
     this._provider.getAll(BlockSchemaIdentifier).forEach(schema => {
       this._schema.register([schema]);
     });
+    // 当前 Store 对应的 Doc（由父 provider 提供）
     this._doc = this._provider.get(DocIdentifier);
     this._crud = new DocCRUD(this._yBlocks, this._schema);
     if (readonly !== undefined) {
@@ -595,7 +676,11 @@ export class Store {
       this._query = query;
     }
 
+    // 监听 Y.Map('blocks') 的深层变化（块的增删以及块内属性变化）
     this._yBlocks.observeDeep(this._handleYEvents);
+    // 初始化时把 Y.Doc 中已有的块补建为 Block 实例。
+    // 这里先同步广播一次 yBlockUpdated('add')，再真正创建 Block；
+    // 如果该 id 已经处理过则跳过，避免重复。
     this._yBlocks.forEach((_, id) => {
       this._handleYBlockAdd(id, false);
 
@@ -605,9 +690,16 @@ export class Store {
       this._onBlockAdded(id, false, true);
     });
 
+    // 订阅放在补建之后：初始化阶段的块已直接处理过，后续变化才走订阅回调
+    // （_onBlockAdded 内也有幂等判断，重复触发不会创建重复 Block）
     this._subscribeToSlots();
   }
 
+  /**
+   * 把内部事件流接到具体逻辑上：
+   * - yBlockUpdated 是 Yjs 事件的「原始」通道，在这里转为 Block 的创建 / 移除；
+   * - 其余 slots 只是交由 disposableGroup 托管，dispose 时统一 complete。
+   */
   private readonly _subscribeToSlots = () => {
     this.disposableGroup.add(
       this.slots.yBlockUpdated.subscribe(({ type, id, isLocal }) => {
@@ -623,12 +715,18 @@ export class Store {
         }
       })
     );
+    // Subject 也交给 disposableGroup 托管：dispose 时会对其调用 complete()
     this.disposableGroup.add(this.slots.ready);
     this.disposableGroup.add(this.slots.blockUpdated);
     this.disposableGroup.add(this.slots.rootAdded);
     this.disposableGroup.add(this.slots.rootDeleted);
   };
 
+  /**
+   * 兄弟节点查询的公共逻辑：先找到 block 的父节点及其在父节点 children 中的下标，
+   * 再把「父节点 + 下标」交给调用方决定取前驱 / 后继。
+   * 找不到父节点或 block 不在父节点中时返回 null。
+   */
   private _getSiblings<T>(
     block: BlockModel | string,
     fn: (parent: BlockModel, index: number) => T
@@ -646,8 +744,16 @@ export class Store {
     return fn(parent, index);
   }
 
+  /**
+   * 把一个 Yjs 块补建为内存中的 Block（及其 BlockModel）。
+   *
+   * 触发来源：
+   * - 构造时遍历已有 yBlocks（init = true）
+   * - 运行中 slots.yBlockUpdated 收到 'add' 事件（init = false）
+   */
   private _onBlockAdded(id: string, isLocal: boolean, init: boolean) {
     try {
+      // 已经创建过则跳过（初始化和事件可能对同一个块各触发一次）
       if (id in this._blocks.peek()) {
         return;
       }
@@ -657,6 +763,8 @@ export class Store {
         return;
       }
 
+      // 块内属性变化时：先通知 BlockModel 自己的 propsUpdated，
+      // 再通过 store.slots.blockUpdated 广播（UI 组件订阅这两个来源）
       const options: BlockOptions = {
         onChange: (block, key, isLocal) => {
           if (key) {
@@ -674,14 +782,19 @@ export class Store {
       };
 
       const block = new Block(this._schema, yBlock, this, options);
+      // 若 Store 带 query（部分视图），按 query 计算该块的可见类型
+      // （display / hidden / bypass），供渲染层过滤；块本身仍在映射中
       this._runQuery(block);
 
+      // 用新对象整体赋值，而不是原地修改，确保 signals 能感知变化
       this._blocks.value = {
         ...this._blocks.value,
         [id]: block,
       };
+      // BlockModel 自身的 created 事件（由 UI 组件按模型粒度订阅）
       block.model.created.next();
 
+      // 根块有单独的事件
       if (block.model.role === 'root') {
         this.slots.rootAdded.next(id);
       }
@@ -700,6 +813,10 @@ export class Store {
     }
   }
 
+  /**
+   * 块从 Y.Map('blocks') 中删除后的清理：
+   * 先广播事件（此时还能读到 parent），再从内存映射中移除并销毁 Block。
+   */
   private _onBlockRemoved(id: string, isLocal: boolean) {
     try {
       const block = this.getBlock(id);
@@ -718,9 +835,11 @@ export class Store {
         isLocal,
       });
 
+      // 同样用新对象替换，触发 signals 更新
       const { [id]: _, ...blocks } = this._blocks.peek();
       this._blocks.value = blocks;
 
+      // 先通知，再释放块内部的响应式资源
       block.model.deleted.next();
       block.model.dispose();
     } catch (e) {
@@ -753,8 +872,10 @@ export class Store {
       );
     }
 
+    // 允许调用方指定 id（导入 / 复制时需要保持 id 稳定），否则由工作区生成
     const id = blockProps.id ?? this._doc.workspace.idGenerator();
 
+    // 所有写操作都包在事务里，保证一次调用只产生一个 Yjs update
     this.transact(() => {
       this._crud.addBlock(
         id,
@@ -794,6 +915,7 @@ export class Store {
         parentIndex
       );
       ids.push(id);
+      // 连续插入同一个位置时索引要递增，否则后一个块会插到前一个块前面
       typeof parentIndex === 'number' && parentIndex++;
     });
 
@@ -818,6 +940,7 @@ export class Store {
     const parent = this.getParent(targetModel);
     if (!parent) return [];
 
+    // 找到目标块在父节点中的位置，再决定插到它前面还是后面
     const targetIndex =
       parent.children.findIndex(({ id }) => id === targetModel.id) ?? 0;
     const insertIndex = placement === 'before' ? targetIndex : targetIndex + 1;
@@ -866,8 +989,12 @@ export class Store {
       return;
     }
 
+    // 两种用法：
+    // - 传入回调：在事务中执行任意操作（常用于组合多个修改）
+    // - 传入对象：按 props 做增量更新
     const isCallback = typeof callBackOrProps === 'function';
 
+    // 参数既可以是 BlockModel，也可以只是 id
     const model =
       typeof modelOrId === 'string'
         ? this.getBlock(modelOrId)?.model
@@ -880,6 +1007,7 @@ export class Store {
     }
 
     if (!isCallback) {
+      // 更新 children 前先做 schema 校验：父/子 flavour 组合必须合法
       const parent = this.getParent(model);
       this.schema.validate(
         model.flavour,
@@ -901,6 +1029,7 @@ export class Store {
 
     this.transact(() => {
       if (isCallback) {
+        // 回调可能移动块或改属性，执行完后重新跑一次 query
         callBackOrProps();
         this._runQuery(block);
         return;
@@ -920,6 +1049,7 @@ export class Store {
           `schema for flavour: ${model.flavour} not found`
         );
       }
+      // 把提交的普通对象写回 Y.Map，同时触发 BlockModel 的响应式更新
       syncBlockProps(schema, model, yBlock, callBackOrProps);
       this._runQuery(block);
       return;
@@ -949,6 +1079,7 @@ export class Store {
       return;
     }
 
+    // 把 bringChildrenTo 的 BlockModel 参数转换成 id，交给底层 CRUD 层
     const opts = (
       options && options.bringChildrenTo
         ? {
@@ -977,6 +1108,7 @@ export class Store {
    * @category Block CRUD
    */
   getBlock(id: string): Block | undefined {
+    // peek() 不建立 signals 依赖：适合命令、事件回调等非响应式场景
     return this._blocks.peek()[id];
   }
 
@@ -988,6 +1120,7 @@ export class Store {
    * @category Block CRUD
    */
   getBlock$(id: string): Block | undefined {
+    // .value 会建立 signals 依赖：在 computed / effect 中调用才能随块变化重算
     return this._blocks.value[id];
   }
 
@@ -1012,6 +1145,7 @@ export class Store {
    * @category Block CRUD
    */
   getBlocksByFlavour(blockFlavour: string | string[]): Block[] {
+    // 单个 flavour 或 flavour 数组都可以
     const flavours =
       typeof blockFlavour === 'string' ? [blockFlavour] : blockFlavour;
 
@@ -1169,6 +1303,8 @@ export class Store {
     return new Transformer({
       schema: this.schema,
       blobCRUD: this.workspace.blobSync,
+      // 导入 / 复制内容时可能引用其他文档，因此通过 Workspace 级别的
+      // createDoc / getDoc / removeDoc 来操作子文档
       docCRUD: {
         create: (id: string) => this.workspace.createDoc(id).getStore({ id }),
         get: (id: string) =>
@@ -1219,16 +1355,20 @@ export class Store {
    * @category Store Lifecycle
    */
   load(initFn?: () => void) {
+    // dispose 之后再次 load：重建资源组并重新订阅 slots
     if (this._isDisposed) {
       this.disposableGroup = new DisposableGroup();
       this._subscribeToSlots();
       this._isDisposed = false;
     }
 
+    // 加载 Y.Doc 与根块（initFn 用于创建初始块）
     this._doc.load(initFn);
     this._provider.getAll(StoreExtensionIdentifier).forEach(ext => {
       ext.loaded();
     });
+    // 通知外部：文档与扩展均已就绪；
+    // rootAdded 平时由块新增触发，这里在 load 后补发一次，方便晚订阅的 UI 初始化
     this.slots.ready.next();
     this.slots.rootAdded.next(this.root?.id ?? '');
     return this;
@@ -1240,6 +1380,9 @@ export class Store {
    * @category Store Lifecycle
    */
   dispose() {
+    // 先让扩展释放资源（例如 HistoryExtension 解绑 UndoManager 事件），
+    // 再解除 Yjs 监听，最后 complete 所有事件流；
+    // 结尾把 _isDisposed 置为 true，load() 可据此重新订阅 slots、复用该 Store
     this._provider.getAll(StoreExtensionIdentifier).forEach(ext => {
       ext.disposed();
     });
@@ -1255,19 +1398,39 @@ export class Store {
     this._isDisposed = true;
   }
 
+  /**
+   * 把 Yjs 的「块新增」事件转成内部事件。
+   * 单独抽出来是为了让构造阶段也能同步处理已有块（直接调用本方法），
+   * 而不依赖订阅是否已建立。
+   */
   private _handleYBlockAdd(id: string, isLocal: boolean) {
     this.slots.yBlockUpdated.next({ type: 'add', id, isLocal });
   }
 
+  /**
+   * 把 Yjs 的「块删除」事件转成内部事件（由 _subscribeToSlots 消费并清理 Block）。
+   */
   private _handleYBlockDelete(id: string, isLocal: boolean) {
     this.slots.yBlockUpdated.next({ type: 'delete', id, isLocal });
   }
 
+  /**
+   * 解析单个 Yjs 事件：只关心顶层 Y.Map('blocks') 上的 add / delete，
+   * 并判断变更来源是否为本机（isLocal），供上层区分远端协作者的改动。
+   */
   private _handleYEvent(event: Y.YEvent<YBlock | Y.Text | Y.Array<unknown>>) {
     // event on top-level block store
+    // 只处理直接作用于顶层 Y.Map('blocks') 的事件；
+    // 块内部的属性变化由 Block 自己订阅，不在这里重复响应
     if (event.target !== this._yBlocks) {
       return;
     }
+    // 判断是否本地来源：
+    // - 没有 origin（程序内部直接写入）
+    // - UndoManager 触发的 undo/redo
+    // - BlockSuite 响应式代理（reactive proxy，origin.proxy === true）
+    // 都视为本地；否则只有 origin === clientID 才算本地。
+    // 远端同步过来的 update 使用的是 provider 的 origin，因此为 false。
     const isLocal =
       !event.transaction.origin ||
       !this._yBlocks.doc ||
@@ -1292,6 +1455,10 @@ export class Store {
     });
   }
 
+  /**
+   * observeDeep 的回调：逐条分发给 _handleYEvent。
+   * 使用箭头函数字段保证引用稳定，unobserveDeep 时才能正确解绑。
+   */
   private readonly _handleYEvents = (events: Y.YEvent<YBlock | Y.Text>[]) => {
     events.forEach(event => this._handleYEvent(event));
   };
